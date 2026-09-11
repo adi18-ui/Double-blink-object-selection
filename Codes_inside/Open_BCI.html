@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BCI Gaze Selection Web Application</title>
+    
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@600;700;800&display=swap" rel="stylesheet">
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                    },
+                },
+            },
+        }
+    </script>
+
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <style>
+        :root {
+            --bg-app: #0F172A;
+            --card-idle: #1E293B;
+            --border-idle: #475569;
+            --highlight: #22C55E;
+            --glow: rgba(34, 197, 94, 0.45);
+            --selected: #EF4444;
+            --cooldown: #38BDF8;
+            --disabled-overlay: rgba(15, 23, 42, 0.45);
+        }
+
+        body {
+            background-color: var(--bg-app);
+            color: #F8FAFC;
+            font-family: 'Inter', sans-serif;
+            overflow-x: hidden;
+        }
+
+        /* Hardware Accelerated Smooth Linear Transitions */
+        .bci-card {
+            transition: transform 250ms ease-out, border-color 250ms ease-out, box-shadow 250ms ease-out, background-color 250ms ease-out;
+            will-change: transform, border-color, box-shadow, background-color;
+        }
+
+        /* Scroller Styling for Event Logger */
+        .custom-scroller::-webkit-scrollbar {
+            width: 6px;
+        }
+        .custom-scroller::-webkit-scrollbar-track {
+            background: rgba(30, 41, 59, 0.5);
+            border-radius: 4px;
+        }
+        .custom-scroller::-webkit-scrollbar-thumb {
+            background: rgba(71, 85, 105, 0.8);
+            border-radius: 4px;
+        }
+        .custom-scroller::-webkit-scrollbar-thumb:hover {
+            background: rgba(148, 163, 184, 1);
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .bci-card, .cooldown-bar-fill {
+                transition: none !important;
+                animation: none !important;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useReducer, createContext, useContext } = React;
+
+        // ==========================================
+        // 1. SERVICES: BCI Input Abstraction Layer
+        // ==========================================
+        const BCIInputService = {
+            focusCard: (id) => {
+                window.dispatchEvent(new CustomEvent('bci-gaze', { detail: { id } }));
+            },
+            leaveGaze: () => {
+                window.dispatchEvent(new CustomEvent('bci-gaze-leave'));
+            },
+            triggerBlink: () => {
+                window.dispatchEvent(new CustomEvent('bci-blink'));
+            }
+        };
+
+        // ==========================================
+        // 2. GLOBAL STATE SYSTEM: Zustand Equivalent
+        // ==========================================
+        const BCIContext = createContext();
+
+        const initialState = {
+            focusedCardId: null,
+            selectedCardId: null,
+            fsmState: 'IDLE', // IDLE | GAZE_FOCUSED | SELECTED | COOLDOWN
+            logs: []
+        };
+
+        function bciReducer(state, action) {
+            const timestamp = new Date().toLocaleTimeString();
+            let newLogs = [...state.logs];
+            
+            if (action.logText) {
+                newLogs.unshift({ time: timestamp, text: action.logText });
+                if (newLogs.length > 30) newLogs.pop(); // Maintained history buffer
+            }
+
+            switch (action.type) {
+                case 'SET_FOCUS':
+                    return { ...state, focusedCardId: action.payload, fsmState: 'GAZE_FOCUSED', logs: newLogs };
+                case 'CLEAR_FOCUS':
+                    return { ...state, focusedCardId: null, fsmState: 'IDLE', logs: newLogs };
+                case 'SET_SELECTED':
+                    return { ...state, selectedCardId: action.payload, fsmState: 'SELECTED', logs: newLogs };
+                case 'SET_COOLDOWN':
+                    return { ...state, fsmState: 'COOLDOWN', logs: newLogs };
+                case 'RESET_TO_IDLE':
+                    return { ...state, fsmState: 'IDLE', selectedCardId: null, logs: newLogs };
+                default:
+                    return state;
+            }
+        }
+
+        // ==========================================
+        // 3. CUSTOM HOOKS: FSM Engine & Hysteresis
+        // ==========================================
+        function useBCIController(dispatch, fsmState, focusedCardId) {
+            const hysteresisTimeoutRef = useRef(null);
+
+            useEffect(() => {
+                const handleGaze = (e) => {
+                    if (fsmState === 'COOLDOWN') return;
+                    if (hysteresisTimeoutRef.current) clearTimeout(hysteresisTimeoutRef.current);
+                    
+                    dispatch({ type: 'SET_FOCUS', payload: e.detail.id, logText: `Gaze Focus locked to Card ${e.detail.id}` });
+                };
+
+                const handleGazeLeave = () => {
+                    if (fsmState === 'COOLDOWN' || fsmState === 'IDLE') return;
+                    
+                    // 100ms Hysteresis Lag Filter to minimize unintentional eye jitter escapes
+                    if (hysteresisTimeoutRef.current) clearTimeout(hysteresisTimeoutRef.current);
+                    hysteresisTimeoutRef.current = setTimeout(() => {
+                        dispatch({ type: 'CLEAR_FOCUS', logText: 'Hysteresis complete: Gaze registered exit' });
+                    }, 1000);
+                };
+
+                const handleBlink = () => {
+                    if (fsmState === 'COOLDOWN') {
+                        dispatch({ type: 'LOG_ONLY', logText: 'Blink ignored: Cooldown lock engaged' });
+                        return;
+                    }
+                    if (fsmState === 'GAZE_FOCUSED' && focusedCardId !== null) {
+                        const targetsId = focusedCardId;
+                        dispatch({ type: 'SET_SELECTED', payload: targetsId, logText: `Selection Verified on Card ${targetsId} via Blink` });
+                        dispatch({ type: 'SET_COOLDOWN', logText: 'System Context: Transitioning to COOLDOWN state (1500ms)' });
+                    }
+                };
+
+                window.addEventListener('bci-gaze', handleGaze);
+                window.addEventListener('bci-gaze-leave', handleGazeLeave);
+                window.addEventListener('bci-blink', handleBlink);
+
+                return () => {
+                    window.removeEventListener('bci-gaze', handleGaze);
+                    window.removeEventListener('bci-gaze-leave', handleGazeLeave);
+                    window.removeEventListener('bci-blink', handleBlink);
+                    if (hysteresisTimeoutRef.current) clearTimeout(hysteresisTimeoutRef.current);
+                };
+            }, [fsmState, focusedCardId, dispatch]);
+        }
+
+        function useCooldown(fsmState, dispatch) {
+            const [progress, setProgress] = useState(0);
+            
+            useEffect(() => {
+                if (fsmState !== 'COOLDOWN') {
+                    setProgress(0);
+                    return;
+                }
+
+                const duration = 1500;
+                const intervalStep = 20;
+                let elapsed = 0;
+
+                const timer = setInterval(() => {
+                    elapsed += intervalStep;
+                    const calculatedProgress = Math.min((elapsed / duration) * 100, 100);
+                    setProgress(calculatedProgress);
+
+                    if (elapsed >= duration) {
+                        clearInterval(timer);
+                        dispatch({ type: 'RESET_TO_IDLE', logText: 'FSM Cycle Complete: Returning to IDLE' });
+                    }
+                }, intervalStep);
+
+                return () => clearInterval(timer);
+            }, [fsmState, dispatch]);
+
+            return progress;
+        }
+
+        // ==========================================
+        // 4. ATOMIC COMPONENTS
+        // ==========================================
+        function CooldownBar({ progress }) {
+            return (
+                <div className="w-full bg-slate-800 h-3 rounded-full overflow-hidden shadow-inner border border-slate-700/50">
+                    <div 
+                        className="h-full bg-cyan-400 cooldown-bar-fill shadow-[0_0_12px_#38BDF8]"
+                        style={{ width: `${progress}%`, transition: 'width 20ms linear' }}
+                    />
+                </div>
+            );
+        }
+
+        function StatusOverlay({ fsmState, cooldownProgress }) {
+            if (fsmState !== 'COOLDOWN') return null;
+            return (
+                <div className="fixed inset-0 bg-[#0F172A]/50 z-40 flex flex-col items-center justify-center backdrop-blur-[2px] transition-all duration-300">
+                    <div className="bg-slate-900/90 border-2 border-cyan-500/30 px-8 py-5 rounded-2xl flex flex-col items-center gap-3 shadow-2xl max-w-sm w-full mx-4">
+                        <div className="flex items-center gap-2 text-cyan-400 font-bold tracking-wide uppercase text-sm animate-pulse">
+                            <i data-lucide="refresh-cw" className="w-4 h-4 animate-spin"></i>
+                            Refractory Cooldown Block
+                        </div>
+                        <CooldownBar progress={cooldownProgress} />
+                        <span className="text-xs text-slate-400 font-semibold tracking-wider">SYSTEM PAUSED — WAITING STABILIZATION</span>
+                    </div>
+                </div>
+            );
+        }
+
+        function GridCard({ id, label, description, iconName, fsmState, focusedCardId, selectedCardId }) {
+            const isFocused = focusedCardId === id && fsmState === 'GAZE_FOCUSED';
+            const isSelected = selectedCardId === id && fsmState === 'SELECTED';
+            const isSystemCooldown = fsmState === 'COOLDOWN';
+
+            let cardStyles = "border-2 border-slate-600 bg-slate-800/80 shadow-md";
+            
+            if (isFocused) {
+                cardStyles = "border-[8px] border-emerald-500 bg-emerald-950/20 scale-[1.04] shadow-[0_0_30px_rgba(34,197,94,0.45)] z-10";
+            } else if (isSelected) {
+                cardStyles = "border-[8px] border-red-500 bg-red-950/30 scale-[1.04] shadow-[0_0_35px_rgba(239,68,68,0.5)] z-10";
+            } else if (isSystemCooldown) {
+                cardStyles = "border-2 border-slate-700 bg-slate-900/40 opacity-40 scale-100 cursor-not-allowed";
+            }
+
+            useEffect(() => {
+                if (window.lucide) window.lucide.createIcons();
+            }, [iconName]);
+
+            return (
+                <div 
+                    role="button"
+                    aria-pressed={isSelected}
+                    aria-label={`BCI Target Element ${id}: ${label}`}
+                    tabIndex="0"
+                    className={`bci-card rounded-3xl p-10 flex flex-col items-center justify-center text-center cursor-pointer min-h-[220px] select-none ${cardStyles}`}
+                    onMouseEnter={() => BCIInputService.focusCard(id)}
+                    onMouseLeave={() => BCIInputService.leaveGaze()}
+                    onClick={() => isFocused && BCIInputService.triggerBlink()}
+                >
+                    <div className={`p-5 rounded-2xl mb-5 transition-colors ${isFocused ? 'bg-emerald-500/20 text-emerald-400' : isSelected ? 'bg-red-500/20 text-red-400' : 'bg-slate-700/50 text-slate-300'}`}>
+                        <i data-lucide={iconName} className="w-12 h-12"></i>
+                    </div>
+                    <h3 className="text-2xl font-extrabold tracking-tight mb-2">{label}</h3>
+                    <p className="text-sm text-slate-400 max-w-[240px] font-medium leading-relaxed">{description}</p>
+                </div>
+            );
+        }
+
+        function Grid() {
+            const { state } = useContext(BCIContext);
+            const cards = [
+                { id: 1, label: "COMMUNICATION", description: "Open standard phrases terminal", iconName: "message-square" },
+                { id: 2, label: "ENVIRONMENT", description: "Climate control hardware array", iconName: "sliders" },
+                { id: 3, label: "ENTERTAINMENT", description: "Stream Media and lab channels", iconName: "tv" },
+                { id: 4, label: "NURSE CALL", description: "Dispatch high-priority alert system", iconName: "bell" }
+            ];
+
+            return (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-[56px] w-full max-w-[1200px] h-full max-h-[680px] p-6 mx-auto">
+                    {cards.map(card => (
+                        <GridCard 
+                            key={card.id}
+                            id={card.id}
+                            label={card.label}
+                            description={card.description}
+                            iconName={card.iconName}
+                            fsmState={state.fsmState}
+                            focusedCardId={state.focusedCardId}
+                            selectedCardId={state.selectedCardId}
+                        />
+                    ))}
+                </div>
+            );
+        }
+
+        // ==========================================
+        // 5. DEVELOPER CONTROL TOOLBAR PANEL
+        // ==========================================
+        function DevPanel({ cooldownProgress }) {
+            const { state, dispatch } = useContext(BCIContext);
+            const [isOpen, setIsOpen] = useState(false);
+            const [isAutoCycling, setIsAutoCycling] = useState(false);
+            const autoCycleIntervalRef = useRef(null);
+
+            useEffect(() => {
+                const handleKeyDown = (e) => {
+                    if (e.key.toLowerCase() === 'd') setIsOpen(prev => !prev);
+                    if (['1', '2', '3', '4'].includes(e.key)) BCIInputService.focusCard(parseInt(e.key));
+                    if (e.key === 'Enter') BCIInputService.triggerBlink();
+                    if (e.key === 'Escape') BCIInputService.leaveGaze();
+                };
+                window.addEventListener('keydown', handleKeyDown);
+                return () => window.removeEventListener('keydown', handleKeyDown);
+            }, []);
+
+            useEffect(() => {
+                if (isAutoCycling && state.fsmState !== 'COOLDOWN') {
+                    autoCycleIntervalRef.current = setInterval(() => {
+                        const randomId = Math.floor(Math.random() * 4) + 1;
+                        BCIInputService.focusCard(randomId);
+                        
+                        // Simulate natural human gaze dwelling, then blink
+                        setTimeout(() => {
+                            BCIInputService.triggerBlink();
+                        }, 800);
+                    }, 2200);
+                } else {
+                    clearInterval(autoCycleIntervalRef.current);
+                }
+                return () => clearInterval(autoCycleIntervalRef.current);
+            }, [isAutoCycling, state.fsmState]);
+
+            useEffect(() => {
+                if (window.lucide) window.lucide.createIcons();
+            }, [isOpen, state.fsmState, isAutoCycling]);
+
+            return (
+                <div className={`fixed bottom-0 right-0 left-0 bg-slate-900 border-t border-slate-700/80 shadow-2xl z-50 transition-all duration-300 ${isOpen ? 'translate-y-0' : 'translate-y-[calc(100%-44px)]'}`}>
+                    
+                    {/* Panel Trigger Handle Header */}
+                    <div 
+                        onClick={() => setIsOpen(!isOpen)}
+                        className="bg-slate-950 px-6 py-2.5 flex justify-between items-center cursor-pointer select-none hover:bg-slate-900/90 transition-colors"
+                    >
+                        <div className="flex items-center gap-3">
+                            <span className="flex h-2.5 w-2.5 relative">
+                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+                            </span>
+                            <span className="text-xs font-bold tracking-widest text-slate-300 uppercase">BCI Lab Diagnostics Panel</span>
+                        </div>
+                        <div className="flex items-center gap-4 text-xs font-semibold text-slate-400">
+                            <span className="bg-slate-800 px-2.5 py-0.5 rounded text-slate-400 border border-slate-700">Hotkeys: 1-4 Focus | Enter Selection | [D] Hide</span>
+                            <i data-lucide={isOpen ? "chevron-down" : "chevron-up"} className="w-4 h-4 text-slate-400"></i>
+                        </div>
+                    </div>
+
+                    {/* Diagnostic Toolkit Body */}
+                    <div className="p-6 grid grid-cols-1 lg:grid-cols-12 gap-6 max-h-[340px] overflow-hidden">
+                        
+                        {/* Simulation Matrix Block */}
+                        <div className="lg:col-span-5 flex flex-col gap-4 border-r border-slate-800/80 pr-6">
+                            <h4 className="text-xs font-bold text-slate-400 uppercase tracking-widest">Manual Hardware Matrix Simulators</h4>
+                            <div className="grid grid-cols-2 gap-2">
+                                {[1, 2, 3, 4].map(id => (
+                                    <button 
+                                        key={id} 
+                                        onClick={() => BCIInputService.focusCard(id)}
+                                        disabled={state.fsmState === 'COOLDOWN'}
+                                        className="bg-slate-800 hover:bg-slate-700/80 disabled:opacity-30 border border-slate-700 px-3 py-2 rounded-xl text-xs font-bold text-slate-200 text-left flex justify-between items-center transition-colors"
+                                    >
+                                        Gaze Target {id}
+                                        {state.focusedCardId === id && state.fsmState === 'GAZE_FOCUSED' && <span className="h-2 w-2 rounded-full bg-emerald-500 shadow-[0_0_8px_#10B981]" />}
+                                    </button>
+                                ))}
+                            </div>
+                            <div className="flex gap-2 w-full">
+                                <button 
+                                    onClick={() => BCIInputService.triggerBlink()}
+                                    disabled={state.fsmState === 'COOLDOWN'}
+                                    className="flex-1 bg-gradient-to-r from-red-600 to-red-700 hover:from-red-500 hover:to-red-600 disabled:from-slate-800 disabled:to-slate-800 disabled:opacity-40 text-white font-bold py-2.5 px-4 rounded-xl text-xs uppercase tracking-wider flex items-center justify-center gap-2 transition-all shadow-md"
+                                >
+                                    <i data-lucide="eye" className="w-3.5 h-3.5"></i> Trigger Neural Blink
+                                </button>
+                                <button 
+                                    onClick={() => BCIInputService.leaveGaze()}
+                                    disabled={state.fsmState === 'COOLDOWN' || state.fsmState === 'IDLE'}
+                                    className="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 font-bold px-3 py-2.5 rounded-xl text-xs uppercase"
+                                    title="Simulate Gaze Exit"
+                                >
+                                    Exit Focus
+                                </button>
+                            </div>
+                            <button 
+                                onClick={() => setIsAutoCycling(prev => !prev)}
+                                className={`w-full font-bold py-2 px-4 rounded-xl text-xs uppercase tracking-wider flex items-center justify-center gap-2 transition-colors border ${isAutoCycling ? 'bg-emerald-950/60 border-emerald-500 text-emerald-400' : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'}`}
+                            >
+                                <i data-lucide="activity" className={`w-3.5 h-3.5 ${isAutoCycling ? 'animate-pulse' : ''}`}></i>
+                                {isAutoCycling ? 'Disable Random Gaze Loop' : 'Enable Random Gaze Cycle Loop'}
+                            </button>
+                        </div>
+
+                        {/* Pipeline Telemetry State Display */}
+                        <div className="lg:col-span-3 flex flex-col gap-3 border-r border-slate-800/80 pr-6">
+                            <h4 className="text-xs font-bold text-slate-400 uppercase tracking-widest">Telemetry Engine States</h4>
+                            <div className="bg-slate-950 p-4 rounded-xl border border-slate-800 flex flex-col gap-3 h-full justify-center">
+                                <div className="flex items-center justify-between">
+                                    <span className="text-xs text-slate-400 font-semibold">Active FSM Core:</span>
+                                    <span className={`text-xs px-2.5 py-0.5 rounded font-extrabold tracking-wide uppercase ${
+                                        state.fsmState === 'IDLE' ? 'bg-slate-800 text-slate-400' :
+                                        state.fsmState === 'GAZE_FOCUSED' ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' :
+                                        state.fsmState === 'SELECTED' ? 'bg-red-950 text-red-400 border border-red-900' :
+                                        'bg-cyan-950 text-cyan-400 border border-cyan-900'
+                                    }`}>{state.fsmState}</span>
+                                </div>
+                                <div className="flex items-center justify-between">
+                                    <span className="text-xs text-slate-400 font-semibold">Gaze Dwelling ID:</span>
+                                    <span className="text-xs font-bold text-slate-200">{state.focusedCardId || 'NULL'}</span>
+                                </div>
+                                <div className="flex flex-col gap-1.5">
+                                    <span className="text-xs text-slate-400 font-semibold">Refractory Period:</span>
+                                    <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
+                                        <div className="bg-cyan-500 h-full transition-all duration-75" style={{ width: `${cooldownProgress}%` }} />
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Real-Time Event Log Scroller */}
+                        <div className="lg:col-span-4 flex flex-col gap-2 h-full">
+                            <h4 className="text-xs font-bold text-slate-400 uppercase tracking-widest">Signal Stream Pipeline Logs</h4>
+                            <div className="bg-slate-950 rounded-xl border border-slate-800 p-3 flex-1 overflow-y-auto custom-scroller flex flex-col gap-1.5 text-[11px] font-mono max-h-[190px]">
+                                {state.logs.length === 0 ? (
+                                    <span className="text-slate-600 italic text-center my-auto">Awaiting hardware event streams...</span>
+                                ) : (
+                                    state.logs.map((log, index) => (
+                                        <div key={index} className="flex gap-2 line-clamp-1 border-b border-slate-900/40 pb-1 text-slate-300">
+                                            <span className="text-slate-500 shrink-0">[{log.time}]</span>
+                                            <span className="text-emerald-400/90 shrink-0">➔</span>
+                                            <span className="truncate">{log.text}</span>
+                                        </div>
+                                    ))
+                                )}
+                            </div>
+                        </div>
+
+                    </div>
+                </div>
+            );
+        }
+
+        // ==========================================
+        // 6. MAIN APP ORCHESTRATION CONTAINER
+        // ==========================================
+        function App() {
+            const [state, dispatch] = useReducer(bciReducer, initialState);
+            
+            // Invoke Core Hardware Event Hooks
+            useBCIController(dispatch, state.fsmState, state.focusedCardId);
+            const cooldownProgress = useCooldown(state.fsmState, dispatch);
+
+            return (
+                <BCIContext.Provider value={{ state, dispatch }}>
+                    <main className="min-h-screen w-screen flex flex-col items-center justify-center p-6 md:p-12 relative overflow-hidden pb-24">
+                        
+                        {/* Live Lab Diagnostics Status Banner */}
+                        <header className="absolute top-6 left-6 right-6 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 z-30 pointer-events-none" aria-live="polite">
+                            <div>
+                                <h1 className="text-xl font-extrabold tracking-tight text-slate-100 flex items-center gap-2">
+                                    BCI Neural Interface Matrix
+                                    <span className="text-[10px] tracking-widest font-mono font-bold bg-emerald-500/10 text-emerald-400 px-2 py-0.5 rounded border border-emerald-500/20">v1.4-PROD</span>
+                                </h1>
+                                <p className="text-xs text-slate-400 font-semibold mt-0.5">Neuroscience Laboratory Environment Interface Engine</p>
+                            </div>
+                            <div className="bg-slate-800/90 border border-slate-700/60 rounded-xl px-4 py-2 flex items-center gap-6 shadow-xl backdrop-blur-sm">
+                                <div className="flex items-center gap-2 text-xs font-bold text-slate-300">
+                                    <span className={`h-2 w-2 rounded-full ${state.fsmState === 'COOLDOWN' ? 'bg-cyan-400 shadow-[0_0_8px_#38BDF8]' : 'bg-emerald-400 shadow-[0_0_8px_#34D399]'}`} />
+                                    SYSTEM STATE: {state.fsmState}
+                                </div>
+                            </div>
+                        </header>
+
+                        {/* Interactive UI Selection Grid */}
+                        <Grid />
+
+                        {/* Hardware Intercept Isolation Overlays */}
+                        <StatusOverlay fsmState={state.fsmState} cooldownProgress={cooldownProgress} />
+
+                        {/* Diagnostics & Monitoring Utility Dashboard */}
+                        <DevPanel cooldownProgress={cooldownProgress} />
+
+                    </main>
+                </BCIContext.Provider>
+            );
+        }
+
+        // Render Application Context Root
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+    <script src="https://webgazer.cs.brown.edu/webgazer.js"></script>
+    <script src="bci_integration.js"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+{
+  "description": "Per-channel normalization stats from the TRAINING split (seed=42) of X.npy. Live input MUST be normalized with these exact values: x_norm = (x - mean) / std, applied per channel.",
+  "sample_rate_hz": 256,
+  "window_samples": 768,
+  "window_seconds": 3.0,
+  "n_channels": 2,
+  "channel_order": "must match training: ch0 then ch1",
+  "channel_mean": [-1.1673, -1.5997],
+  "channel_std": [160.4709, 196.7938],
+  "recommended_threshold": 0.5,
+  "notes": "Doubles cluster 0.6-0.96, non-doubles cap at ~0.44; clean gap near 0.45. Raise threshold toward 0.6-0.7 to further suppress false selections since recall has headroom."
+}
